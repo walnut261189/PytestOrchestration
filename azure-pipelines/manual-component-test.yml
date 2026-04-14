@@ -1,0 +1,123 @@
+# ─────────────────────────────────────────────────────────────────
+# azure-pipelines/manual-component-test.yml
+#
+# Manual trigger pipeline – test a single component on demand.
+# Trigger from Azure DevOps UI → Run Pipeline → set parameters.
+# ─────────────────────────────────────────────────────────────────
+
+trigger: none   # manual only
+
+parameters:
+  - name: component
+    displayName: "Component to test"
+    type: string
+    default: adapter
+    values:
+      - adapter
+      - router
+      - proxy
+      - processor
+      - db
+      - landing
+      - integration
+      - e2e
+      - smoke
+      - all
+
+  - name: test_level
+    displayName: "Test level"
+    type: string
+    default: unit
+    values:
+      - unit
+      - integration
+      - e2e
+      - smoke
+      - all
+
+  - name: environment
+    displayName: "Target environment"
+    type: string
+    default: onprem
+    values:
+      - onprem
+      - cloud
+
+  - name: use_docker_compose
+    displayName: "Spin up Docker Compose?"
+    type: boolean
+    default: false
+
+variables:
+  PYTHON_VERSION: "3.11"
+
+stages:
+  - stage: ManualTest
+    displayName: "Manual – ${{ parameters.component }} (${{ parameters.test_level }})"
+    jobs:
+      - job: Test
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+
+          - script: pip install -r requirements-test.txt
+            displayName: "Install dependencies"
+
+          - ${{ if eq(parameters.use_docker_compose, true) }}:
+            - script: |
+                docker compose -f docker/docker-compose.test.yml up -d
+                sleep 20
+              displayName: "Start containers"
+
+          - script: |
+              # Build pytest marker expression
+              COMP="${{ parameters.component }}"
+              LEVEL="${{ parameters.test_level }}"
+
+              if [ "$COMP" = "all" ] && [ "$LEVEL" = "all" ]; then
+                MARKER=""
+                TEST_PATH="tests/"
+              elif [ "$COMP" = "all" ]; then
+                MARKER="-m $LEVEL"
+                TEST_PATH="tests/"
+              elif [ "$LEVEL" = "all" ]; then
+                MARKER="-m $COMP"
+                TEST_PATH="tests/"
+              elif [ "$LEVEL" = "unit" ]; then
+                MARKER="-m 'unit and $COMP'"
+                TEST_PATH="tests/unit/test_$COMP/"
+              else
+                MARKER="-m '$LEVEL'"
+                TEST_PATH="tests/$LEVEL/"
+              fi
+
+              echo "pytest $TEST_PATH $MARKER"
+              pytest $TEST_PATH $MARKER \
+                --junitxml=reports/junit-manual.xml \
+                --html=reports/report-manual.html \
+                --self-contained-html \
+                -v
+            displayName: "Run tests"
+            env:
+              ENV: ${{ parameters.environment }}
+
+          - ${{ if eq(parameters.use_docker_compose, true) }}:
+            - script: docker compose -f docker/docker-compose.test.yml down -v
+              condition: always()
+              displayName: "Tear down containers"
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "reports/junit-manual.xml"
+              testRunTitle: "Manual – ${{ parameters.component }} / ${{ parameters.test_level }}"
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: reports
+              artifact: manual-test-reports

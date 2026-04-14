@@ -1,0 +1,147 @@
+# ─────────────────────────────────────────────────────────────────
+# docker/docker-compose.test.yml
+#
+# Spins up all pipeline components for integration / e2e testing.
+# Replace image names and ports to match your actual images.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.test.yml up -d
+#   docker compose -f docker/docker-compose.test.yml down -v
+# ─────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+networks:
+  pipeline-net:
+    driver: bridge
+
+volumes:
+  cratedb-data:
+
+services:
+
+  # ── CrateDB ──────────────────────────────────────────────────────
+  cratedb:
+    image: crate:latest
+    container_name: test-cratedb
+    ports:
+      - "4200:4200"    # HTTP / Admin UI
+      - "5432:5432"    # PostgreSQL-wire protocol
+    environment:
+      - CRATE_HEAP_SIZE=512m
+    volumes:
+      - cratedb-data:/data
+    networks:
+      - pipeline-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Adapter ──────────────────────────────────────────────────────
+  adapter:
+    image: ${ADAPTER_IMAGE:-your-registry/iot-adapter:latest}
+    container_name: test-adapter
+    ports:
+      - "5000:5000"
+    environment:
+      - ENV=onprem
+      - ROUTER_HOST=router
+      - ROUTER_PORT=6000
+    networks:
+      - pipeline-net
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Router ───────────────────────────────────────────────────────
+  router:
+    image: ${ROUTER_IMAGE:-your-registry/iot-router:latest}
+    container_name: test-router
+    ports:
+      - "6000:6000"
+    environment:
+      - ENV=onprem
+      - PROXY_HOST=proxy
+      - PROXY_PORT=7000
+    networks:
+      - pipeline-net
+    depends_on:
+      proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Proxy ────────────────────────────────────────────────────────
+  proxy:
+    image: ${PROXY_IMAGE:-your-registry/iot-proxy:latest}
+    container_name: test-proxy
+    ports:
+      - "7000:7000"
+    environment:
+      - ENV=onprem
+      - PROCESSOR_HOST=processor
+      - PROCESSOR_PORT=8501
+    networks:
+      - pipeline-net
+    depends_on:
+      processor:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Streamlit Processor ──────────────────────────────────────────
+  processor:
+    image: ${PROCESSOR_IMAGE:-your-registry/iot-processor:latest}
+    container_name: test-processor
+    ports:
+      - "8501:8501"
+    environment:
+      - ENV=onprem
+      - CRATEDB_HOST=cratedb
+      - CRATEDB_PORT=5432
+      - CRATEDB_HTTP_PORT=4200
+    networks:
+      - pipeline-net
+    depends_on:
+      cratedb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Landing Page ─────────────────────────────────────────────────
+  landing:
+    image: ${LANDING_IMAGE:-your-registry/iot-landing:latest}
+    container_name: test-landing
+    ports:
+      - "3000:3000"
+    environment:
+      - ENV=onprem
+      - PROCESSOR_HOST=processor
+      - PROCESSOR_PORT=8501
+      - CRATEDB_HOST=cratedb
+    networks:
+      - pipeline-net
+    depends_on:
+      processor:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

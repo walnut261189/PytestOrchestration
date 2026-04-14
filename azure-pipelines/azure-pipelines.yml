@@ -1,0 +1,236 @@
+# ─────────────────────────────────────────────────────────────────
+# azure-pipelines/azure-pipelines.yml
+#
+# Main Azure DevOps pipeline for the IoT test orchestration.
+#
+# TOGGLE GUIDE
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Run only unit tests (CI – no Docker needed):               │
+# │    Set pipeline variable: RUN_UNIT=true                     │
+# │                                                             │
+# │  Run only integration tests:                                │
+# │    Set pipeline variable: RUN_INTEGRATION=true              │
+# │                                                             │
+# │  Run both (full CI/CD):                                     │
+# │    Set both variables to true                               │
+# │                                                             │
+# │  Manual trigger for a single component:                     │
+# │    Set TEST_COMPONENT=adapter|router|proxy|processor|db     │
+# │                                                             │
+# │  Target environment:                                        │
+# │    Set ENV=onprem (default) or ENV=cloud                    │
+# └─────────────────────────────────────────────────────────────┘
+# ─────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+  paths:
+    exclude:
+      - docs/**
+      - "*.md"
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+# ── Pipeline-level variables ──────────────────────────────────────
+variables:
+  # Toggle these in Azure DevOps → Pipeline → Edit → Variables
+  # or pass them via pipeline variable groups.
+  RUN_UNIT: "true"
+  RUN_INTEGRATION: "false"
+  RUN_E2E: "false"
+  RUN_SMOKE: "false"
+  TEST_COMPONENT: "all"          # all | adapter | router | proxy | processor | db | landing
+  ENV: "onprem"                  # onprem | cloud
+  PYTHON_VERSION: "3.11"
+  DOCKER_COMPOSE_FILE: "docker/docker-compose.test.yml"
+
+# ── Stage 1: Unit tests (no Docker required) ──────────────────────
+stages:
+  - stage: UnitTests
+    displayName: "Unit Tests"
+    condition: eq(variables['RUN_UNIT'], 'true')
+    jobs:
+      - job: RunUnitTests
+        displayName: "Run unit tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+            displayName: "Set up Python $(PYTHON_VERSION)"
+
+          - script: pip install -r requirements-test.txt
+            displayName: "Install test dependencies"
+
+          - script: |
+              if [ "$(TEST_COMPONENT)" = "all" ]; then
+                MARKER="unit"
+              else
+                MARKER="unit and $(TEST_COMPONENT)"
+              fi
+              echo "Running: pytest -m '$MARKER'"
+              pytest tests/unit/ -m "$MARKER" \
+                --junitxml=reports/junit-unit.xml \
+                --html=reports/report-unit.html \
+                --self-contained-html \
+                -v
+            displayName: "Run unit tests"
+            env:
+              ENV: $(ENV)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "reports/junit-unit.xml"
+              testRunTitle: "Unit Tests – $(TEST_COMPONENT)"
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: reports
+              artifact: unit-test-reports
+
+  # ── Stage 2: Integration tests (Docker containers required) ──────
+  - stage: IntegrationTests
+    displayName: "Integration Tests"
+    condition: eq(variables['RUN_INTEGRATION'], 'true')
+    dependsOn: UnitTests
+    jobs:
+      - job: RunIntegrationTests
+        displayName: "Spin up containers + run integration tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+            displayName: "Set up Python"
+
+          - script: pip install -r requirements-test.txt
+            displayName: "Install test dependencies"
+
+          - script: |
+              echo "Starting containers via Docker Compose..."
+              docker compose -f $(DOCKER_COMPOSE_FILE) up -d
+              echo "Waiting for services to initialise..."
+              sleep 20
+            displayName: "Start Docker containers"
+
+          - script: |
+              if [ "$(TEST_COMPONENT)" = "all" ]; then
+                MARKER="integration"
+              else
+                MARKER="integration and $(TEST_COMPONENT)"
+              fi
+              echo "Running: pytest -m '$MARKER'"
+              pytest tests/integration/ -m "$MARKER" \
+                --junitxml=reports/junit-integration.xml \
+                --html=reports/report-integration.html \
+                --self-contained-html \
+                -v
+            displayName: "Run integration tests"
+            env:
+              ENV: $(ENV)
+              ADAPTER_HOST: localhost
+              ROUTER_HOST: localhost
+              PROXY_HOST: localhost
+              PROCESSOR_HOST: localhost
+              CRATEDB_HOST: localhost
+              LANDING_HOST: localhost
+
+          - script: docker compose -f $(DOCKER_COMPOSE_FILE) down -v
+            condition: always()
+            displayName: "Tear down containers"
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "reports/junit-integration.xml"
+              testRunTitle: "Integration Tests – $(TEST_COMPONENT)"
+
+          - task: PublishPipelineArtifact@1
+            condition: always()
+            inputs:
+              targetPath: reports
+              artifact: integration-test-reports
+
+  # ── Stage 3: E2E tests (run post-deployment) ──────────────────────
+  - stage: E2ETests
+    displayName: "E2E Tests"
+    condition: eq(variables['RUN_E2E'], 'true')
+    dependsOn: IntegrationTests
+    jobs:
+      - job: RunE2ETests
+        displayName: "End-to-end pipeline tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+
+          - script: pip install -r requirements-test.txt
+
+          - script: |
+              pytest tests/e2e/ -m "e2e" \
+                --junitxml=reports/junit-e2e.xml \
+                --html=reports/report-e2e.html \
+                --self-contained-html \
+                -v
+            displayName: "Run E2E tests"
+            env:
+              ENV: $(ENV)
+              ADAPTER_HOST: $(ADAPTER_HOST)
+              ROUTER_HOST: $(ROUTER_HOST)
+              PROXY_HOST: $(PROXY_HOST)
+              PROCESSOR_HOST: $(PROCESSOR_HOST)
+              CRATEDB_HOST: $(CRATEDB_HOST)
+              LANDING_HOST: $(LANDING_HOST)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "reports/junit-e2e.xml"
+              testRunTitle: "E2E Tests"
+
+  # ── Stage 4: Smoke tests (fastest post-deploy sanity) ─────────────
+  - stage: SmokeTests
+    displayName: "Smoke Tests"
+    condition: eq(variables['RUN_SMOKE'], 'true')
+    jobs:
+      - job: Smoke
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(PYTHON_VERSION)
+
+          - script: pip install -r requirements-test.txt
+
+          - script: |
+              pytest tests/e2e/ -m "smoke" \
+                --junitxml=reports/junit-smoke.xml \
+                -v --tb=short
+            displayName: "Run smoke tests"
+            env:
+              ENV: $(ENV)
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "reports/junit-smoke.xml"
+              testRunTitle: "Smoke Tests"

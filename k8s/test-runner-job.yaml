@@ -1,0 +1,97 @@
+# ─────────────────────────────────────────────────────────────────
+# k8s/test-runner-job.yaml
+#
+# Kubernetes Job that runs the test suite as a one-shot pod.
+# Use this when your on-prem or AKS cluster hosts the services.
+#
+# Usage:
+#   kubectl apply -f k8s/test-runner-job.yaml
+#   kubectl logs -f job/iot-pipeline-test-runner
+#   kubectl delete job iot-pipeline-test-runner   # cleanup
+# ─────────────────────────────────────────────────────────────────
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iot-pipeline-test-runner
+  namespace: iot-pipeline          # adjust to your namespace
+  labels:
+    app: iot-test-runner
+    triggered-by: azure-devops
+spec:
+  ttlSecondsAfterFinished: 600     # auto-delete after 10 min
+  backoffLimit: 0                  # no retries on failure
+  template:
+    metadata:
+      labels:
+        app: iot-test-runner
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test-runner
+          image: your-registry/iot-test-runner:latest  # build from Dockerfile.test
+          imagePullPolicy: Always
+          command:
+            - pytest
+            - tests/
+            - -m
+            - "$(TEST_MARKER)"     # injected via env
+            - --junitxml=/reports/junit.xml
+            - --html=/reports/report.html
+            - --self-contained-html
+            - -v
+          env:
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: iot-test-config
+                  key: environment
+            - name: TEST_MARKER
+              valueFrom:
+                configMapKeyRef:
+                  name: iot-test-config
+                  key: test_marker
+            # ── Component hosts ──────────────────────────────────
+            - name: ADAPTER_HOST
+              value: "adapter-service.iot-pipeline.svc.cluster.local"
+            - name: ADAPTER_PORT
+              value: "5000"
+            - name: ROUTER_HOST
+              value: "router-service.iot-pipeline.svc.cluster.local"
+            - name: ROUTER_PORT
+              value: "6000"
+            - name: PROXY_HOST
+              value: "proxy-service.iot-pipeline.svc.cluster.local"
+            - name: PROXY_PORT
+              value: "7000"
+            - name: PROCESSOR_HOST
+              value: "processor-service.iot-pipeline.svc.cluster.local"
+            - name: PROCESSOR_PORT
+              value: "8501"
+            - name: CRATEDB_HOST
+              value: "cratedb-service.iot-pipeline.svc.cluster.local"
+            - name: CRATEDB_PORT
+              value: "5432"
+            - name: CRATEDB_HTTP_PORT
+              value: "4200"
+            - name: LANDING_HOST
+              value: "landing-service.iot-pipeline.svc.cluster.local"
+            - name: LANDING_PORT
+              value: "3000"
+          volumeMounts:
+            - name: reports
+              mountPath: /reports
+      volumes:
+        - name: reports
+          emptyDir: {}
+
+---
+# ConfigMap – override these before applying the Job
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iot-test-config
+  namespace: iot-pipeline
+data:
+  environment: "onprem"        # onprem | cloud
+  test_marker: "smoke"         # smoke | unit | integration | e2e
