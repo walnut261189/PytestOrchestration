@@ -1,1022 +1,813 @@
 # IoT Pipeline – Test Orchestration Reference Guide
 
-> **Purpose:** Step-by-step reference for setting up, running, extending, and maintaining the pytest-based test orchestration suite for the IoT data pipeline. Covers on-prem (Docker Compose & Kubernetes) and Azure Cloud environments, wired into Azure DevOps.
+> **Purpose:** Step-by-step reference for the pytest-based test orchestration suite. Covers the multi-adapter architecture, per-adapter Mosquitto brokers, processor dual-target routing, on-prem (Docker Compose & Kubernetes) and Azure Cloud environments, all wired into Azure DevOps.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture overview](#1-architecture-overview)
-2. [Project structure explained](#2-project-structure-explained)
-3. [Prerequisites](#3-prerequisites)
-4. [First-time setup](#4-first-time-setup)
-5. [Running tests locally](#5-running-tests-locally)
-6. [Azure DevOps integration](#6-azure-devops-integration)
-7. [Environment configuration](#7-environment-configuration)
-8. [Docker Compose setup (on-prem)](#8-docker-compose-setup-on-prem)
-9. [Kubernetes setup (on-prem)](#9-kubernetes-setup-on-prem)
-10. [Switching to Azure Cloud](#10-switching-to-azure-cloud)
-11. [Adding a new component](#11-adding-a-new-component)
-12. [Test layer reference](#12-test-layer-reference)
-13. [Pytest marker cheat sheet](#13-pytest-marker-cheat-sheet)
-14. [Troubleshooting](#14-troubleshooting)
+2. [Multi-adapter design](#2-multi-adapter-design)
+3. [Processor routing (on-prem vs cloud)](#3-processor-routing-on-prem-vs-cloud)
+4. [Project structure explained](#4-project-structure-explained)
+5. [Prerequisites](#5-prerequisites)
+6. [First-time setup](#6-first-time-setup)
+7. [Running tests locally](#7-running-tests-locally)
+8. [Azure DevOps integration](#8-azure-devops-integration)
+9. [Environment configuration](#9-environment-configuration)
+10. [Docker Compose setup (on-prem)](#10-docker-compose-setup-on-prem)
+11. [Kubernetes setup (on-prem)](#11-kubernetes-setup-on-prem)
+12. [Switching to Azure Cloud](#12-switching-to-azure-cloud)
+13. [Adding a new adapter type](#13-adding-a-new-adapter-type)
+14. [Test layer reference](#14-test-layer-reference)
+15. [Pytest marker cheat sheet](#15-pytest-marker-cheat-sheet)
+16. [Troubleshooting](#16-troubleshooting)
 
 ---
 
 ## 1. Architecture overview
 
-The pipeline under test consists of six components, each running in its own Docker container:
-
 ```
-Edge Devices (voltage, current, temperature, ...)
+Edge Devices (voltage sensors, current probes, temp sensors, ...)
        │
-       ▼
-  [ Adapter ]          Listens to edge devices via MQTT / Modbus / OPC-UA.
-       │               Normalises raw payloads into a standard schema.
-       ▼
-  [ Router ]           Receives normalised messages and dispatches them
-       │               to the correct downstream service based on routing rules.
-       ▼
-  [ Proxy Server ]     Forwards requests, adds tracing headers,
-       │               and manages upstream timeouts.
-       ▼
-  [ Streamlit          Ingests data, applies transformations,
-    Processor ]        and persists records to CrateDB.
+       │  MQTT publish → topic: devices/<device_id>
+       │  payload contains "type" field: "voltage" | "current" | "temperature" | ...
        │
-       ▼
-  [ CrateDB ]          Time-series database. Stores all device readings.
-       │
-       ▼
-  [ Landing Page ]     Visualisation layer. Reads from CrateDB and
-                       exposes device data via a REST API consumed by the UI.
+   ┌───┴──────────────────────────────────────────┐
+   │                                              │
+   ▼                                              ▼
+[ Voltage Adapter ]                    [ Current Adapter ]   [ Temperature Adapter ] ...
+  + Mosquitto broker                     + Mosquitto broker    + Mosquitto broker
+  port 1884 (MQTT)                       port 1885             port 1886
+  port 5001 (HTTP API)                   port 5002             port 5003
+   │                                              │                    │
+   └──────────────────────┬───────────────────────┘                    │
+                          │  HTTP POST (normalised payload)            │
+                          ▼                                            │
+                     [ Router ]  ◄──────────────────────────────────────
+                          │
+                          ▼
+                     [ Proxy Server ]
+                          │
+                          ▼
+                  [ Streamlit Processor ]
+                  PROCESSOR_TARGET=onprem → CrateDB (on-prem)
+                  PROCESSOR_TARGET=cloud  → Cloud DB (Azure SQL etc.)
+                          │
+               ┌──────────┴──────────┐
+               ▼                     ▼
+          [ CrateDB ]          [ Cloud DB ]
+               │
+               ▼
+          [ Landing Page ]  (visualisation, reads from CrateDB)
 ```
-
-The test suite mirrors this topology exactly. Tests are organised into three layers:
-
-| Layer | What it tests | Docker needed? |
-|---|---|---|
-| **Unit** | Each component in isolation via its HTTP API | No |
-| **Integration** | Data flowing across component boundaries | Yes |
-| **E2E** | Full path from adapter publish to landing page visibility | Yes |
-| **Smoke** | Fastest possible post-deployment sanity check | Yes (services up) |
 
 ---
 
-## 2. Project structure explained
+## 2. Multi-adapter design
+
+### Core rules
+
+- Each adapter type (voltage, current, temperature, ...) is a **separate Docker container**
+- Each adapter **embeds its own Mosquitto broker** on a unique port — they do not share a broker
+- All adapters publish to the **same topic prefix** `devices/<device_id>` but include a `"type"` field in every payload that identifies the adapter
+- All adapters expose the **same HTTP management API** shape (`/health`, `/status`, `/metrics`, `/devices/<id>`)
+- The test suite uses a `BaseAdapterTests` class that all adapter types inherit — shared behaviour is tested once; type-specific behaviour (voltage ranges, unit checks) is tested in each subclass
+
+### Topic and payload convention
+
+**Topic:** `devices/<device_id>` — identical across all adapter types
+
+**Structured JSON payload (default):**
+```json
+{
+  "device_id": "device-001",
+  "type": "voltage",
+  "ts": 1700000000000,
+  "v": 230.0,
+  "i": 3.2,
+  "t": 45.0
+}
+```
+
+**Raw CSV payload (legacy devices):**
+```
+230.0,3.2,45.0
+```
+Order is always `voltage,current,temperature`. The adapter infers type from its own identity, not the payload.
+
+**Normalised output (post-adapter, HTTP downstream):**
+```json
+{
+  "device_id": "device-001",
+  "type": "voltage",
+  "timestamp": 1700000000000,
+  "readings": {
+    "voltage": 230.0,
+    "current": 3.2,
+    "temperature": 45.0,
+    "power": 736.0
+  }
+}
+```
+
+### Adapter registry
+
+`utils/adapter_registry.py` is the single place that lists all known adapter types with their ports and payload fields. When you add a new adapter type, this is the first file to update — the rest of the test infrastructure reads from it.
+
+```python
+# Current registry entries:
+AdapterTypeSpec(type_name="voltage",     mqtt_port=1884, default_port=5001, ...)
+AdapterTypeSpec(type_name="current",     mqtt_port=1885, default_port=5002, ...)
+AdapterTypeSpec(type_name="temperature", mqtt_port=1886, default_port=5003, ...)
+# Add new types here
+```
+
+### Per-adapter MQTT client fixtures
+
+`conftest.py` provides convenient named fixtures AND a generic factory:
+
+```python
+# Named (for most tests):
+def test_voltage(voltage_mqtt_client, voltage_adapter_cfg): ...
+def test_current(current_mqtt_client, current_adapter_cfg): ...
+def test_temp(temperature_mqtt_client, temperature_adapter_cfg): ...
+
+# Factory (for parametrised or registry-driven tests):
+def test_all_adapters(mqtt_client_for, adapter_config):
+    for type_name in ("voltage", "current", "temperature"):
+        client = mqtt_client_for(type_name)
+        cfg    = adapter_config(type_name)
+```
+
+---
+
+## 3. Processor routing (on-prem vs cloud)
+
+The Streamlit processor reads a single env variable at startup:
+
+```
+PROCESSOR_TARGET=onprem   →  writes to CrateDB (on-prem)
+PROCESSOR_TARGET=cloud    →  writes to cloud DB (Azure SQL / CosmosDB / ADX)
+```
+
+### How this affects tests
+
+Two custom pytest markers auto-skip tests that don't apply to the current target:
+
+| Marker | Runs when | Skipped when |
+|---|---|---|
+| `@pytest.mark.processor_onprem` | `PROCESSOR_TARGET=onprem` | `PROCESSOR_TARGET=cloud` |
+| `@pytest.mark.processor_cloud` | `PROCESSOR_TARGET=cloud` | `PROCESSOR_TARGET=onprem` |
+
+This means the same test suite handles both environments — you don't maintain separate test files.
+
+### Running processor tests for each target
+
+```bash
+# Test on-prem routing (data should land in CrateDB)
+PROCESSOR_TARGET=onprem pytest tests/unit/test_processor/ -m processor
+
+# Test cloud routing (data should land in cloud DB)
+PROCESSOR_TARGET=cloud pytest tests/unit/test_processor/ -m processor
+
+# Run both in the same pipeline (Azure DevOps):
+# Stage 1: PROCESSOR_TARGET=onprem
+# Stage 2: PROCESSOR_TARGET=cloud
+```
+
+### What the routing tests verify
+
+**On-prem tests (`processor_onprem`):**
+- Routing status endpoint reports `target=onprem`
+- An ingested record is queryable in CrateDB within 3 seconds
+- All three adapter types (voltage, current, temperature) land in CrateDB
+- Cloud DB is not written to
+
+**Cloud tests (`processor_cloud`):**
+- Routing status endpoint reports `target=cloud`
+- An ingested record does NOT appear in CrateDB
+- All three adapter types are accepted and return 200
+
+---
+
+## 4. Project structure explained
 
 ```
 iot-pipeline-tests/
 │
-├── azure-pipelines/
-│   ├── azure-pipelines.yml           # Main CI/CD pipeline definition
-│   └── manual-component-test.yml     # Manual on-demand pipeline with UI dropdowns
+├── utils/
+│   └── adapter_registry.py           # ★ Central registry of all adapter types.
+│                                     #   AdapterTypeSpec: type_name, ports, fields.
+│                                     #   Add new adapters here first.
 │
 ├── config/
-│   └── env_config.py                 # Single source of truth for all host/port config.
-│                                     # Reads from environment variables.
-│                                     # ENV=onprem uses on-prem defaults.
-│                                     # ENV=cloud uses AZURE_* variables.
+│   └── env_config.py                 # All host/port config.
+│                                     #   AdapterInstanceConfig per adapter type.
+│                                     #   ProcessorConfig with target field.
+│                                     #   CrateDBConfig + CloudDBConfig (both).
+│                                     #   PROCESSOR_TARGET env var controls routing.
 │
 ├── docker/
-│   └── docker-compose.test.yml       # Brings up all six containers for integration
-│                                     # and E2E testing. Healthchecks ensure correct
-│                                     # startup order.
-│
-├── k8s/
-│   └── test-runner-job.yaml          # Kubernetes Job that runs the test suite as a
-│                                     # one-shot pod inside the cluster. Includes a
-│                                     # ConfigMap for test_marker and environment.
+│   └── docker-compose.test.yml       # ★ One service per adapter type:
+│                                     #   adapter-voltage  (MQTT 1884, HTTP 5001)
+│                                     #   adapter-current  (MQTT 1885, HTTP 5002)
+│                                     #   adapter-temperature (MQTT 1886, HTTP 5003)
+│                                     #   processor gets PROCESSOR_TARGET injected.
 │
 ├── tests/
-│   ├── conftest.py                   # Root-level fixtures shared across ALL tests:
-│   │                                 #   - env_config, per-component URLs
-│   │                                 #   - http_client (requests.Session)
-│   │                                 #   - wait_for_service helpers
-│   │                                 #   - sample_device_payload factory
-│   │                                 #   - auto-skip logic for onprem/cloud markers
+│   ├── conftest.py                   # Root fixtures:
+│   │                                 #   adapter_config(type_name) factory
+│   │                                 #   mqtt_client_for(type_name) factory
+│   │                                 #   voltage/current/temperature named shortcuts
+│   │                                 #   mqtt_message_collector(type_name, topic)
+│   │                                 #   make_mqtt_payload(type, ..., raw_csv=False)
+│   │                                 #   make_normalised_payload(type, ...)
+│   │                                 #   processor_target fixture
+│   │                                 #   Auto-skip for processor_onprem/processor_cloud
 │   │
 │   ├── unit/
 │   │   ├── test_adapter/
-│   │   │   └── test_adapter.py       # Health, payload ingestion, normalisation,
-│   │   │                             # protocol stubs (MQTT mock), burst tests
-│   │   ├── test_router/
-│   │   │   └── test_router.py        # Health, route table, dispatch, metrics,
-│   │   │                             # high-frequency routing
-│   │   ├── test_proxy/
-│   │   │   └── test_proxy.py         # Health, forwarding, header injection,
-│   │   │                             # oversized payload, concurrent requests
+│   │   │   ├── test_adapter.py       # Legacy/generic adapter HTTP tests
+│   │   │   └── adapters/
+│   │   │       ├── base_adapter_tests.py       # ★ Shared test class all adapters inherit
+│   │   │       ├── test_voltage_adapter.py     # Voltage-specific: range, overvoltage, units
+│   │   │       ├── test_current_adapter.py     # Current-specific: overcurrent, zero load
+│   │   │       └── test_temperature_adapter.py # Temp-specific: sub-zero, high-temp
+│   │   │
 │   │   ├── test_processor/
-│   │   │   └── test_processor.py     # Health, ingest, data retrieval, aggregates,
-│   │   │                             # pipeline stats
-│   │   ├── test_db/
-│   │   │   └── test_db.py            # CrateDB connectivity, schema validation,
-│   │   │                             # CRUD, aggregation queries, bulk insert perf
-│   │   └── test_landing/
-│   │       └── test_landing.py       # Health, device list, latest reading,
-│   │                                 # time-series history, dashboard summary
+│   │   │   └── test_processor.py     # ★ Routing tests:
+│   │   │                             #   TestProcessorOnPremRouting (processor_onprem)
+│   │   │                             #   TestProcessorCloudRouting (processor_cloud)
+│   │   │                             #   All three adapter types tested against each target
+│   │   │
+│   │   ├── test_mqtt/                # Mosquitto broker tests (generic, used by all adapters)
+│   │   ├── test_router/              # Router HTTP tests
+│   │   ├── test_proxy/               # Proxy HTTP tests
+│   │   ├── test_db/                  # CrateDB schema + CRUD tests
+│   │   └── test_landing/             # Landing page API tests
 │   │
 │   ├── integration/
-│   │   └── test_integration.py       # Adapter→Router, Router→Proxy, Proxy→Processor,
-│   │                                 # Processor→CrateDB, full adapter-to-DB pipeline
+│   │   └── test_integration.py       # Entry point: MQTT publish on each adapter type
 │   │
 │   └── e2e/
-│       └── test_e2e.py               # Landing page health, data visibility after
-│                                     # publish, multi-device, time-series, smoke suite
+│       └── test_e2e.py               # Smoke: all adapters + both routing targets
 │
-├── reports/                          # Auto-generated after every run:
-│                                     #   junit.xml  → Azure DevOps test results
-│                                     #   report.html → Human-readable HTML report
+├── azure-pipelines/
+│   ├── azure-pipelines.yml           # CI/CD with PROCESSOR_TARGET variable
+│   └── manual-component-test.yml     # Manual trigger with adapter type + routing target dropdowns
 │
-├── .env.example                      # Template for local environment variables
-├── pytest.ini                        # Markers, test paths, output settings, timeout
-├── requirements-test.txt             # All Python test dependencies
-└── README.md                         # Quick-start guide
+├── .env.example                      # All ADAPTER_VOLTAGE_*, ADAPTER_CURRENT_*,
+│                                     # ADAPTER_TEMPERATURE_*, PROCESSOR_TARGET vars
+└── pytest.ini                        # Markers: voltage, current, temperature,
+                                      #          processor_onprem, processor_cloud
 ```
 
 ---
 
-## 3. Prerequisites
+## 5. Prerequisites
 
-### For running unit tests (no containers)
+### Unit tests (no containers)
 
-- Python 3.11 or higher
-- pip
-- The component under test must be reachable at the configured host/port
+- Python 3.11+
+- `pip install -r requirements-test.txt`
+- Each component running and reachable at configured host/port
 
-### For running integration and E2E tests
+### Integration and E2E
 
 - Docker Engine 24+
-- Docker Compose v2 (`docker compose` not `docker-compose`)
-- All six container images built and accessible (local or registry)
+- Docker Compose v2
+- All adapter images + shared service images built and accessible
 
-### For Kubernetes
+### For processor cloud routing tests
 
-- `kubectl` configured against your cluster
-- The namespace `iot-pipeline` created, or update `k8s/test-runner-job.yaml` to your namespace
-- Test runner image pushed to your container registry
-
-### For Azure DevOps
-
-- An Azure DevOps project with a repository containing this test project
-- Agent pool with Docker installed (for integration/E2E stages)
-- Pipeline variables or variable groups configured (see Section 6)
+- A reachable cloud DB (Azure SQL / CosmosDB / ADX)
+- `CLOUD_DB_*` vars set in `.env` or Azure DevOps variable group
 
 ---
 
-## 4. First-time setup
+## 6. First-time setup
 
-Follow these steps in order the very first time you set up this project.
-
-### Step 1 — Clone or copy the project
-
-Place the `iot-pipeline-tests/` directory at the root of your repository, or as a sibling directory to your pipeline services.
+### Step 1 — Place in your repo
 
 ```
 your-repo/
-├── adapter/
+├── adapter-voltage/
+├── adapter-current/
+├── adapter-temperature/
 ├── router/
 ├── proxy/
 ├── processor/
 ├── landing/
-└── iot-pipeline-tests/        ← place it here
+└── iot-pipeline-tests/
 ```
 
-### Step 2 — Create a Python virtual environment
+### Step 2 — Create virtual environment and install
 
 ```bash
 cd iot-pipeline-tests
 python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-```
-
-### Step 3 — Install test dependencies
-
-```bash
+source .venv/bin/activate
 pip install -r requirements-test.txt
 ```
 
-This installs: `pytest`, `pytest-html`, `pytest-timeout`, `pytest-xdist`, `pytest-rerunfailures`, `requests`, `python-dotenv`.
-
-### Step 4 — Create your local .env file
+### Step 3 — Create .env
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in the actual host/port values for your local setup. The defaults assume Docker Compose with all services on `localhost`.
+Minimum values for unit testing:
 
 ```bash
-# Minimum required for unit tests against running services
 ENV=onprem
-ADAPTER_HOST=localhost
-ADAPTER_PORT=5000
-ROUTER_HOST=localhost
-ROUTER_PORT=6000
-PROXY_HOST=localhost
-PROXY_PORT=7000
-PROCESSOR_HOST=localhost
-PROCESSOR_PORT=8501
-CRATEDB_HOST=localhost
-CRATEDB_PORT=5432
-CRATEDB_HTTP_PORT=4200
-LANDING_HOST=localhost
-LANDING_PORT=3000
+PROCESSOR_TARGET=onprem      # or cloud
+MQTT_TOPIC_PREFIX=devices
+
+ADAPTER_VOLTAGE_HOST=localhost
+ADAPTER_VOLTAGE_PORT=5001
+ADAPTER_VOLTAGE_MQTT_PORT=1884
+
+ADAPTER_CURRENT_HOST=localhost
+ADAPTER_CURRENT_PORT=5002
+ADAPTER_CURRENT_MQTT_PORT=1885
+
+ADAPTER_TEMPERATURE_HOST=localhost
+ADAPTER_TEMPERATURE_PORT=5003
+ADAPTER_TEMPERATURE_MQTT_PORT=1886
 ```
 
-### Step 5 — Update endpoint paths in test files
+### Step 4 — Update adapter registry if your ports differ
 
-Each test file uses common endpoint paths (`/health`, `/publish`, `/route`, `/forward`, `/ingest`). If your components use different paths, update them in the relevant `test_<component>.py` file. Look for the client class at the top of each file — all paths are defined there in one place.
+Open `utils/adapter_registry.py` and update `mqtt_port`, `default_port`, `mqtt_ws_port` to match your actual container port assignments.
 
-For example in `tests/unit/test_adapter/test_adapter.py`:
+### Step 5 — Update response schema assertions
 
-```python
-class AdapterClient:
-    def health(self):
-        return self.session.get(f"{self.base}/health")      # ← change path here
+In each adapter test file (`test_voltage_adapter.py` etc.) and the processor test, update field name checks to match your actual API response shapes. Look for `body.get(...)` calls in each test method.
 
-    def publish(self, payload):
-        return self.session.post(f"{self.base}/publish", json=payload)   # ← and here
-```
+### Step 6 — Update Docker Compose image names
 
-### Step 6 — Update response schema assertions
-
-Each test checks for specific keys in response bodies. Update these to match your actual API responses. For example, if your adapter returns `{"ack": true, "msg_id": "abc"}` instead of `{"message_id": "abc"}`, update:
-
-```python
-# In test_adapter.py — TestAdapterPayloadIngestion
-def test_publish_returns_acknowledgement(self, adapter_client, sample_device_payload):
-    body = r.json()
-    assert "msg_id" in body or "ack" in body    # ← update to your schema
-```
-
-### Step 7 — Update container image names in Docker Compose
-
-Open `docker/docker-compose.test.yml` and replace the placeholder image names:
-
+In `docker/docker-compose.test.yml`:
 ```yaml
-adapter:
-  image: your-registry/iot-adapter:latest      # ← replace with your actual image
-router:
-  image: your-registry/iot-router:latest       # ← replace
-proxy:
-  image: your-registry/iot-proxy:latest        # ← replace
-processor:
-  image: your-registry/iot-processor:latest    # ← replace
-landing:
-  image: your-registry/iot-landing:latest      # ← replace
+adapter-voltage:
+  image: ${ADAPTER_VOLTAGE_IMAGE:-your-registry/iot-adapter-voltage:latest}  # ← update
+adapter-current:
+  image: ${ADAPTER_CURRENT_IMAGE:-your-registry/iot-adapter-current:latest}  # ← update
+adapter-temperature:
+  image: ${ADAPTER_TEMPERATURE_IMAGE:-your-registry/iot-adapter-temperature:latest}  # ← update
 ```
 
-### Step 8 — Verify setup with a dry run
-
-Run the test collection (no execution) to confirm everything is wired correctly:
+### Step 7 — Dry run
 
 ```bash
 pytest tests/ --collect-only
 ```
 
-You should see all test files and test functions listed without any import errors.
-
 ---
 
-## 5. Running tests locally
+## 7. Running tests locally
 
-### Unit tests — no containers required
+### MQTT tests — per adapter broker
 
-Services must be running (started manually or via Docker), but the tests do not manage containers themselves.
+Each adapter type has its own Mosquitto. Tests connect to the specific broker for that type.
 
 ```bash
-# All unit tests across all components
-pytest tests/unit/ -m unit
+# All MQTT broker tests (connects to each adapter's embedded broker)
+pytest tests/unit/test_mqtt/ -m mqtt
 
-# Single component
-pytest tests/unit/test_adapter/    -m "unit and adapter"
-pytest tests/unit/test_router/     -m "unit and router"
-pytest tests/unit/test_proxy/      -m "unit and proxy"
-pytest tests/unit/test_processor/  -m "unit and processor"
-pytest tests/unit/test_db/         -m "unit and db"
-pytest tests/unit/test_landing/    -m "unit and landing"
+# Unit tests for a specific adapter type
+pytest tests/unit/test_adapter/adapters/test_voltage_adapter.py     -m "unit and adapter and voltage"
+pytest tests/unit/test_adapter/adapters/test_current_adapter.py     -m "unit and adapter and current"
+pytest tests/unit/test_adapter/adapters/test_temperature_adapter.py -m "unit and adapter and temperature"
+
+# All adapter tests at once
+pytest tests/unit/test_adapter/ -m "unit and adapter"
 ```
 
-### Integration tests — Docker Compose required
+### Processor routing tests
 
 ```bash
-# Step 1: Start all containers
+# Test on-prem routing (CrateDB must be up)
+PROCESSOR_TARGET=onprem pytest tests/unit/test_processor/ -m processor
+
+# Test cloud routing (cloud DB must be configured)
+PROCESSOR_TARGET=cloud pytest tests/unit/test_processor/ -m processor
+
+# Test only routing assertions (skip ingest tests)
+pytest tests/unit/test_processor/ -m "processor and (processor_onprem or processor_cloud)"
+```
+
+### Integration tests — all containers required
+
+```bash
+# Start everything (three adapters + shared services)
 docker compose -f docker/docker-compose.test.yml up -d
 
-# Step 2: Wait for all healthchecks to pass (usually 30–60 seconds)
+# Verify all healthy
 docker compose -f docker/docker-compose.test.yml ps
 
-# Step 3: Run integration tests
-pytest tests/integration/ -m integration
+# Run integration tests
+PROCESSOR_TARGET=onprem pytest tests/integration/ -m integration
 
-# Step 4: Tear down containers and volumes when done
+# Tear down
 docker compose -f docker/docker-compose.test.yml down -v
 ```
 
-To run only a specific cross-component boundary:
-
-```bash
-# Only adapter→router boundary tests
-pytest tests/integration/ -m "integration and adapter and router"
-```
-
-### E2E tests — all services must be up
-
-```bash
-pytest tests/e2e/ -m e2e
-```
-
-### Smoke tests — fastest post-deployment check
+### Smoke tests
 
 ```bash
 pytest tests/e2e/ -m smoke
 ```
 
-Smoke tests run in under 30 seconds and verify that all six services respond and a single payload traverses the full pipeline.
-
-### Useful flags
-
-```bash
-# Run in parallel across 4 workers (speeds up unit tests significantly)
-pytest tests/unit/ -m unit -n 4
-
-# Stop after first failure
-pytest tests/unit/ -m unit -x
-
-# Show full traceback on failure
-pytest tests/unit/ -m unit --tb=long
-
-# Rerun flaky tests up to 2 times
-pytest tests/ --reruns 2 --reruns-delay 3
-
-# Generate HTML report to a custom path
-pytest tests/ --html=my-report.html --self-contained-html
-
-# Verbose output with live log streaming
-pytest tests/ -v --log-cli-level=DEBUG
-```
+Smoke tests verify:
+- All three adapter brokers accept connections
+- All service health endpoints return 200
+- One QoS-1 publish per adapter type is acknowledged by each broker
 
 ---
 
-## 6. Azure DevOps integration
+## 8. Azure DevOps integration
 
-### Step 1 — Add the pipeline YAML to your repository
+### Variables to add
 
-Commit both files from `azure-pipelines/` into your repository root or a `pipelines/` folder:
-
-```
-your-repo/
-├── azure-pipelines/
-│   ├── azure-pipelines.yml
-│   └── manual-component-test.yml
-└── iot-pipeline-tests/
-```
-
-### Step 2 — Create the main CI/CD pipeline
-
-1. Go to **Azure DevOps → Pipelines → New Pipeline**
-2. Select your repository source (Azure Repos Git, GitHub, etc.)
-3. Choose **Existing Azure Pipelines YAML file**
-4. Set the path to `azure-pipelines/azure-pipelines.yml`
-5. Click **Save** (do not run yet)
-
-### Step 3 — Create the manual component pipeline
-
-Repeat Step 2 using `azure-pipelines/manual-component-test.yml`. Name it something like `IoT – Manual Component Test`.
-
-### Step 4 — Configure pipeline variables
-
-Go to **Pipelines → your pipeline → Edit → Variables** and add the following. Each variable has a default — only override what you need.
+In addition to the previous set, add:
 
 | Variable | Default | Description |
 |---|---|---|
-| `RUN_UNIT` | `true` | Enable the unit test stage |
-| `RUN_INTEGRATION` | `false` | Enable the integration test stage |
-| `RUN_E2E` | `false` | Enable the E2E test stage |
-| `RUN_SMOKE` | `false` | Enable the smoke test stage |
-| `TEST_COMPONENT` | `all` | Target a single component: `adapter`, `router`, `proxy`, `processor`, `db`, `landing`, or `all` |
-| `ENV` | `onprem` | Target environment: `onprem` or `cloud` |
+| `PROCESSOR_TARGET` | `onprem` | `onprem` or `cloud` — controls processor routing tests |
+| `TEST_ADAPTER_TYPE` | `all` | `all`, `voltage`, `current`, `temperature` |
+| `ADAPTER_VOLTAGE_IMAGE` | — | Full image path for voltage adapter |
+| `ADAPTER_CURRENT_IMAGE` | — | Full image path for current adapter |
+| `ADAPTER_TEMPERATURE_IMAGE` | — | Full image path for temperature adapter |
 
-**To run unit tests only on every PR (recommended CI baseline):**
+### Running processor routing tests in CI
 
-```
-RUN_UNIT=true
-RUN_INTEGRATION=false
-RUN_E2E=false
-RUN_SMOKE=false
-```
+Add two stages in `azure-pipelines.yml` — one per target:
 
-**To run unit + integration on merge to main (full CI):**
-
-```
-RUN_UNIT=true
-RUN_INTEGRATION=true
+```yaml
+# In your pipeline variables, set PROCESSOR_TARGET=onprem for stage 1
+# and PROCESSOR_TARGET=cloud for stage 2.
+# The processor_onprem / processor_cloud markers handle skipping automatically.
 ```
 
-**To run smoke tests after every deployment (CD):**
+### Manual trigger pipeline
 
-Create a separate pipeline or add a deployment gate that sets:
-
-```
-RUN_SMOKE=true
-ENV=onprem        # or cloud, depending on deployment target
-```
-
-### Step 5 — Configure service host variables for integration and E2E stages
-
-When `RUN_INTEGRATION=true` or `RUN_E2E=true`, the pipeline needs to know where the services are. In the integration stage, Docker Compose brings everything up on `localhost` automatically. For E2E against a live environment, add these to your variable group:
-
-```
-ADAPTER_HOST=<your-adapter-host>
-ROUTER_HOST=<your-router-host>
-PROXY_HOST=<your-proxy-host>
-PROCESSOR_HOST=<your-processor-host>
-CRATEDB_HOST=<your-cratedb-host>
-LANDING_HOST=<your-landing-host>
-```
-
-Store sensitive values (passwords, tokens) as **secret variables** in Azure DevOps or reference them from Azure Key Vault via a variable group link.
-
-### Step 6 — Using the manual trigger pipeline
-
-1. Go to **Pipelines → IoT – Manual Component Test → Run Pipeline**
-2. A form appears with four dropdowns:
-   - **Component to test:** `adapter`, `router`, `proxy`, `processor`, `db`, `landing`, `integration`, `e2e`, `smoke`, or `all`
-   - **Test level:** `unit`, `integration`, `e2e`, `smoke`, or `all`
-   - **Target environment:** `onprem` or `cloud`
-   - **Spin up Docker Compose?:** tick if you want the pipeline to bring up containers itself
-3. Click **Run**
-
-This is the recommended way to test a single component after modifying it, or to debug a failing test in isolation.
-
-### Step 7 — View test results
-
-After each pipeline run:
-
-1. Click the run in the pipeline list
-2. Go to the **Tests** tab — Azure DevOps renders the JUnit XML as a full test results dashboard with pass/fail counts, durations, and history
-3. Go to **Artifacts** to download the HTML report (`unit-test-reports`, `integration-test-reports`, etc.)
+The `manual-component-test.yml` has a dropdown for:
+- **Component:** `voltage`, `current`, `temperature`, `adapter` (all), `processor`, `router`, `proxy`, `db`, `landing`, `integration`, `e2e`, `smoke`, `all`
+- **Processor target:** `onprem` or `cloud`
+- **Environment:** `onprem` or `cloud`
 
 ---
 
-## 7. Environment configuration
+## 9. Environment configuration
 
-All configuration lives in `config/env_config.py`. The file uses a simple pattern: read from environment variables with safe defaults.
+### Key variables
 
-### How environment switching works
+| Variable | Example | Description |
+|---|---|---|
+| `PROCESSOR_TARGET` | `onprem` | Controls processor DB routing |
+| `ADAPTER_VOLTAGE_MQTT_PORT` | `1884` | Mosquitto port for voltage adapter |
+| `ADAPTER_CURRENT_MQTT_PORT` | `1885` | Mosquitto port for current adapter |
+| `ADAPTER_TEMPERATURE_MQTT_PORT` | `1886` | Mosquitto port for temperature adapter |
+| `CLOUD_DB_HOST` | `server.database.windows.net` | Cloud DB host |
+| `CLOUD_DB_TYPE` | `azure_sql` | `azure_sql`, `cosmosdb`, or `adx` |
 
-```
-ENV=onprem  →  Uses ADAPTER_HOST, ROUTER_HOST, ... (on-prem defaults)
-ENV=cloud   →  Uses AZURE_ADAPTER_HOST, AZURE_ROUTER_HOST, ... (cloud overrides)
-```
-
-Set `ENV` as an environment variable before running tests:
-
-```bash
-# On-prem (default)
-ENV=onprem pytest tests/ -m smoke
-
-# Azure Cloud
-ENV=cloud pytest tests/ -m smoke
-```
-
-Or in `.env`:
-
-```bash
-ENV=cloud
-```
-
-### Adding a new config field
-
-Open `config/env_config.py` and add the field to the relevant dataclass:
+### How `adapter_config` fixture resolves
 
 ```python
-@dataclass
-class AdapterConfig:
-    host: str
-    port: int
-    protocol: str
-    topic_prefix: str
-    connect_timeout: int = 10
-    tls_enabled: bool = False
-    my_new_field: str = "default_value"    # ← add here
+# In conftest.py, adapter_config("voltage") reads:
+ADAPTER_VOLTAGE_HOST, ADAPTER_VOLTAGE_PORT
+ADAPTER_VOLTAGE_MQTT_HOST, ADAPTER_VOLTAGE_MQTT_PORT
+ADAPTER_VOLTAGE_MQTT_WS_PORT
+ADAPTER_VOLTAGE_MQTT_USERNAME, ADAPTER_VOLTAGE_MQTT_PASSWORD
 ```
 
-Then add it to both `ONPREM_CONFIG` and `CLOUD_CONFIG` lower in the file, reading from an environment variable:
-
-```python
-ONPREM_CONFIG = EnvironmentConfig(
-    adapter=AdapterConfig(
-        ...
-        my_new_field=_env("MY_NEW_FIELD", "default_value"),
-    ),
-    ...
-)
-```
+Pattern: `ADAPTER_{TYPE_NAME_UPPER}_{FIELD}`.
 
 ---
 
-## 8. Docker Compose setup (on-prem)
+## 10. Docker Compose setup (on-prem)
 
-The file `docker/docker-compose.test.yml` defines all six services on a shared bridge network (`pipeline-net`) so they can resolve each other by service name.
+### Port map
+
+| Service | HTTP port | MQTT port | WS port |
+|---|---|---|---|
+| adapter-voltage | 5001 | 1884 | 9002 |
+| adapter-current | 5002 | 1885 | 9003 |
+| adapter-temperature | 5003 | 1886 | 9004 |
+| router | 6000 | — | — |
+| proxy | 7000 | — | — |
+| processor | 8501 | — | — |
+| cratedb | 5432 / 4200 | — | — |
+| landing | 3000 | — | — |
 
 ### Startup order
 
-Docker Compose `depends_on` with `condition: service_healthy` ensures this order:
-
 ```
-cratedb  →  processor  →  proxy  →  router  →  adapter
-                       →  landing
+cratedb → processor → proxy → router → adapter-* (all three in parallel) → landing
 ```
 
-Each service has a `healthcheck` that polls its `/health` endpoint. Services will not start until their dependency is healthy.
-
-### Step 1 — Set image names via environment variables
-
-Rather than hardcoding image names, use environment variables so the same Compose file works across branches and registries:
+### Testing processor routing
 
 ```bash
-export ADAPTER_IMAGE=myregistry.azurecr.io/iot-adapter:dev
-export ROUTER_IMAGE=myregistry.azurecr.io/iot-router:dev
-export PROXY_IMAGE=myregistry.azurecr.io/iot-proxy:dev
-export PROCESSOR_IMAGE=myregistry.azurecr.io/iot-processor:dev
-export LANDING_IMAGE=myregistry.azurecr.io/iot-landing:dev
-docker compose -f docker/docker-compose.test.yml up -d
+# On-prem routing
+PROCESSOR_TARGET=onprem docker compose -f docker/docker-compose.test.yml up -d
+PROCESSOR_TARGET=onprem pytest tests/ -m "integration or smoke"
+
+# Cloud routing (processor sends to cloud DB, not CrateDB)
+PROCESSOR_TARGET=cloud docker compose -f docker/docker-compose.test.yml up -d
+PROCESSOR_TARGET=cloud pytest tests/unit/test_processor/ -m "processor_cloud"
 ```
 
-Or put them in a `.env` file (Docker Compose reads it automatically):
+### Checking a specific adapter's broker
 
 ```bash
-ADAPTER_IMAGE=myregistry.azurecr.io/iot-adapter:dev
-ROUTER_IMAGE=myregistry.azurecr.io/iot-router:dev
-# ...etc
-```
+# Voltage adapter's Mosquitto (port 1884)
+mosquitto_pub -h localhost -p 1884 -t "devices/test-001" \
+  -m '{"device_id":"test-001","type":"voltage","ts":1700000000000,"v":230}' -q 1
 
-### Step 2 — Check all services are healthy
-
-```bash
-docker compose -f docker/docker-compose.test.yml ps
-```
-
-All services should show `healthy` in the STATUS column. If any shows `unhealthy` or `starting`, check logs:
-
-```bash
-docker compose -f docker/docker-compose.test.yml logs adapter
-docker compose -f docker/docker-compose.test.yml logs cratedb
-```
-
-### Step 3 — Run tests
-
-```bash
-pytest tests/integration/ -m integration
-pytest tests/e2e/ -m e2e
-pytest tests/e2e/ -m smoke
-```
-
-### Step 4 — Tear down
-
-```bash
-# Stop containers and remove volumes (clears CrateDB data)
-docker compose -f docker/docker-compose.test.yml down -v
-
-# Stop containers but keep volumes (preserve CrateDB data between runs)
-docker compose -f docker/docker-compose.test.yml down
+# Current adapter's Mosquitto (port 1885)
+mosquitto_pub -h localhost -p 1885 -t "devices/test-002" \
+  -m '{"device_id":"test-002","type":"current","ts":1700000000000,"i":5}' -q 1
 ```
 
 ---
 
-## 9. Kubernetes setup (on-prem)
+## 11. Kubernetes setup (on-prem)
 
-Use this approach when your pipeline services are deployed to a Kubernetes cluster (on-prem or AKS) and you want to run tests from inside the cluster for network proximity.
+### Key changes for multi-adapter
 
-### Step 1 — Build the test runner image
-
-Create a `Dockerfile.test` at the root of your test project:
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements-test.txt .
-RUN pip install --no-cache-dir -r requirements-test.txt
-COPY . .
-ENTRYPOINT ["pytest"]
-```
-
-Build and push:
-
-```bash
-docker build -f Dockerfile.test -t myregistry.azurecr.io/iot-test-runner:latest .
-docker push myregistry.azurecr.io/iot-test-runner:latest
-```
-
-### Step 2 — Update the Kubernetes Job manifest
-
-Open `k8s/test-runner-job.yaml` and update:
-
-**Image name:**
-```yaml
-image: myregistry.azurecr.io/iot-test-runner:latest   # ← your image
-```
-
-**Service DNS names** — follow the pattern `<service-name>.<namespace>.svc.cluster.local`:
-```yaml
-- name: ADAPTER_HOST
-  value: "adapter-svc.iot-pipeline.svc.cluster.local"   # ← your service name and namespace
-- name: ROUTER_HOST
-  value: "router-svc.iot-pipeline.svc.cluster.local"
-# ... repeat for all components
-```
-
-**Namespace:**
-```yaml
-metadata:
-  namespace: iot-pipeline    # ← your namespace
-```
-
-### Step 3 — Configure the test run via ConfigMap
-
-Edit the ConfigMap at the bottom of the YAML before applying:
+In `k8s/test-runner-job.yaml`, add env vars for each adapter:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: iot-test-config
-  namespace: iot-pipeline
-data:
-  environment: "onprem"      # onprem | cloud
-  test_marker: "smoke"       # smoke | unit | integration | e2e
+- name: ADAPTER_VOLTAGE_MQTT_HOST
+  value: "voltage-adapter-svc.iot-pipeline.svc.cluster.local"
+- name: ADAPTER_VOLTAGE_MQTT_PORT
+  value: "1883"   # internal port, not host-mapped
+- name: ADAPTER_CURRENT_MQTT_HOST
+  value: "current-adapter-svc.iot-pipeline.svc.cluster.local"
+- name: ADAPTER_CURRENT_MQTT_PORT
+  value: "1883"
+- name: ADAPTER_TEMPERATURE_MQTT_HOST
+  value: "temperature-adapter-svc.iot-pipeline.svc.cluster.local"
+- name: ADAPTER_TEMPERATURE_MQTT_PORT
+  value: "1883"
+- name: PROCESSOR_TARGET
+  value: "onprem"   # or cloud
 ```
 
-### Step 4 — Apply and monitor
-
-```bash
-# Create the namespace if it doesn't exist
-kubectl create namespace iot-pipeline --dry-run=client -o yaml | kubectl apply -f -
-
-# Apply the Job (also creates the ConfigMap)
-kubectl apply -f k8s/test-runner-job.yaml
-
-# Watch the pod come up
-kubectl get pods -n iot-pipeline -w
-
-# Stream logs
-kubectl logs -f job/iot-pipeline-test-runner -n iot-pipeline
-
-# Check exit code (0 = all tests passed)
-kubectl get job iot-pipeline-test-runner -n iot-pipeline -o jsonpath='{.status.conditions}'
-```
-
-### Step 5 — Clean up
-
-```bash
-kubectl delete job iot-pipeline-test-runner -n iot-pipeline
-```
-
-The Job is also configured with `ttlSecondsAfterFinished: 600` so it auto-deletes 10 minutes after completion.
-
-### Step 6 — Integrate with Azure DevOps (Kubernetes path)
-
-Add a script step in your Azure DevOps pipeline after deployment:
-
-```yaml
-- script: |
-    # Update the ConfigMap with the desired test marker
-    kubectl patch configmap iot-test-config -n iot-pipeline \
-      --patch '{"data": {"test_marker": "smoke", "environment": "onprem"}}'
-
-    # Delete any previous run
-    kubectl delete job iot-pipeline-test-runner -n iot-pipeline --ignore-not-found
-
-    # Apply the new Job
-    kubectl apply -f k8s/test-runner-job.yaml
-
-    # Wait for completion (timeout 5 minutes)
-    kubectl wait job/iot-pipeline-test-runner -n iot-pipeline \
-      --for=condition=complete --timeout=300s
-  displayName: "Run smoke tests on cluster"
-```
+Inside the cluster each adapter uses its own internal port 1883. The host-mapped ports (1884, 1885, 1886) are only needed for local development.
 
 ---
 
-## 10. Switching to Azure Cloud
-
-The cloud environment uses the same test files — only the host/port config changes.
-
-### Step 1 — Populate Azure cloud variables
-
-In `.env` (local) or Azure DevOps variable group (pipeline):
+## 12. Switching to Azure Cloud
 
 ```bash
 ENV=cloud
-AZURE_ADAPTER_HOST=adapter.yourdomain.azure.com
-AZURE_ADAPTER_PORT=443
-AZURE_ROUTER_HOST=router.yourdomain.azure.com
-AZURE_ROUTER_PORT=443
-AZURE_PROXY_HOST=proxy.yourdomain.azure.com
-AZURE_PROXY_PORT=443
-AZURE_PROCESSOR_HOST=processor.yourdomain.azure.com
-AZURE_PROCESSOR_PORT=443
-AZURE_CRATEDB_HOST=cratedb.yourdomain.azure.com
-AZURE_CRATEDB_PORT=5432
-AZURE_CRATEDB_HTTP_PORT=4200
-AZURE_CRATEDB_USER=crate
-AZURE_CRATEDB_PASSWORD=<from Key Vault>
-AZURE_LANDING_HOST=landing.yourdomain.azure.com
-AZURE_LANDING_PORT=443
+PROCESSOR_TARGET=cloud
+
+AZURE_ADAPTER_VOLTAGE_HOST=voltage-adapter.yourdomain.azure.com
+AZURE_ADAPTER_VOLTAGE_MQTT_PORT=8883   # TLS
+AZURE_ADAPTER_CURRENT_HOST=current-adapter.yourdomain.azure.com
+AZURE_ADAPTER_CURRENT_MQTT_PORT=8883
+AZURE_ADAPTER_TEMPERATURE_HOST=temperature-adapter.yourdomain.azure.com
+AZURE_ADAPTER_TEMPERATURE_MQTT_PORT=8883
+
+AZURE_CLOUD_DB_HOST=yourserver.database.windows.net
+AZURE_CLOUD_DB_NAME=iot_pipeline
+AZURE_CLOUD_DB_USER=<from Key Vault>
+AZURE_CLOUD_DB_PASSWORD=<from Key Vault>
 ```
 
-### Step 2 — Enable TLS for the adapter
-
-The cloud adapter config has `tls_enabled: True` by default, which causes the test client to use `https://`. Verify your adapter's cloud certificate is valid and the port is correct.
-
-### Step 3 — Run against cloud
-
-```bash
-ENV=cloud pytest tests/e2e/ -m smoke
-```
-
-### Step 4 — Mark cloud-only tests
-
-If you write tests that only make sense in cloud (e.g. Azure Event Hub integration), mark them:
-
-```python
-@pytest.mark.cloud
-def test_event_hub_integration(self, ...):
-    ...
-```
-
-These will be automatically skipped when `ENV=onprem` and vice-versa for `@pytest.mark.onprem`. The skip logic lives in `conftest.py → pytest_collection_modifyitems`.
+Cloud adapter configs have `mqtt_tls=True` automatically. The `mqtt_client_for` fixture calls `client.tls_set()` for each cloud adapter connection.
 
 ---
 
-## 11. Adding a new component
+## 13. Adding a new adapter type
 
-Follow these steps every time a new service joins the pipeline.
+### Step 1 — Register it
 
-### Step 1 — Add config
-
-In `config/env_config.py`, add a new dataclass and wire it into both `ONPREM_CONFIG` and `CLOUD_CONFIG`:
-
+In `utils/adapter_registry.py`:
 ```python
-@dataclass
-class MyNewServiceConfig:
-    host: str
-    port: int
-    health_endpoint: str = "/health"
-
-# Add to EnvironmentConfig dataclass:
-@dataclass
-class EnvironmentConfig:
-    ...
-    my_new_service: MyNewServiceConfig
-
-# Add to ONPREM_CONFIG:
-ONPREM_CONFIG = EnvironmentConfig(
-    ...
-    my_new_service=MyNewServiceConfig(
-        host=_env("MY_NEW_SERVICE_HOST", "localhost"),
-        port=int(_env("MY_NEW_SERVICE_PORT", "9000")),
-    ),
-)
-
-# Add to CLOUD_CONFIG similarly with AZURE_MY_NEW_SERVICE_* env vars
+AdapterTypeSpec(
+    type_name="pressure",
+    env_key="ADAPTER_PRESSURE",
+    default_port=5004,
+    mqtt_port=1887,
+    mqtt_ws_port=9005,
+    payload_fields=["pressure"],
+    description="Pressure sensor — measures in bar",
+),
 ```
 
-### Step 2 — Add URL fixture to conftest.py
+### Step 2 — Add config
 
+In `config/env_config.py`, add to `ONPREM_CONFIG.adapters` and `CLOUD_CONFIG.adapters`:
 ```python
-@pytest.fixture(scope="session")
-def my_new_service_url(env_config):
-    c = env_config.my_new_service
-    return f"http://{c.host}:{c.port}"
+"pressure": _adapter("pressure", "ADAPTER_PRESSURE", "localhost", 5004, 1887, 9005),
 ```
 
-### Step 3 — Create test directory and files
+### Step 3 — Create test file
 
 ```bash
-mkdir tests/unit/test_my_new_service
-touch tests/unit/test_my_new_service/__init__.py
-touch tests/unit/test_my_new_service/test_my_new_service.py
+touch tests/unit/test_adapter/adapters/test_pressure_adapter.py
 ```
-
-### Step 4 — Write the test file
-
-Use this template:
 
 ```python
+from tests.unit.test_adapter.adapters.base_adapter_tests import BaseAdapterTests
 import pytest
-pytestmark = [pytest.mark.unit, pytest.mark.my_new_service]
 
-@pytest.fixture(scope="module")
-def my_client(my_new_service_url, http_client):
-    class MyClient:
-        def health(self):
-            return http_client.get(f"{my_new_service_url}/health", timeout=5)
-    return MyClient()
+pytestmark = [pytest.mark.unit, pytest.mark.adapter, pytest.mark.pressure]
 
-class TestMyNewServiceHealth:
-    def test_health_returns_200(self, my_client):
-        assert my_client.health().status_code == 200
+class TestPressureAdapter(BaseAdapterTests):
+    ADAPTER_TYPE  = "pressure"
+    PRIMARY_FIELD = "pressure"
+    PRIMARY_VALUE = 1.013          # 1 atm in bar
+
+    def test_nominal_pressure_accepted(self, mqtt, cfg, make_mqtt_payload):
+        # pressure-specific tests here
+        ...
 ```
 
-### Step 5 — Register the marker
-
-Add to `pytest.ini` under `markers`:
+### Step 4 — Register the marker in `pytest.ini`
 
 ```ini
 markers =
     ...
-    my_new_service: Tests for My New Service
+    pressure: Pressure adapter tests
 ```
 
-### Step 6 — Add to Docker Compose
+### Step 5 — Add to Docker Compose
 
 ```yaml
-my-new-service:
-  image: ${MY_NEW_SERVICE_IMAGE:-your-registry/my-new-service:latest}
-  container_name: test-my-new-service
+adapter-pressure:
+  image: ${ADAPTER_PRESSURE_IMAGE:-your-registry/iot-adapter-pressure:latest}
   ports:
-    - "9000:9000"
-  networks:
-    - pipeline-net
-  healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
-    interval: 10s
-    timeout: 5s
-    retries: 10
+    - "5004:5001"
+    - "1887:1883"
+    - "9005:9001"
+  environment:
+    - ADAPTER_TYPE=pressure
 ```
 
-### Step 7 — Add to Azure DevOps manual pipeline
-
-In `azure-pipelines/manual-component-test.yml`, add to the `component` parameter's `values` list:
-
-```yaml
-parameters:
-  - name: component
-    values:
-      - adapter
-      - router
-      - ...
-      - my_new_service    # ← add here
-```
-
-### Step 8 — Add to .env.example
+### Step 6 — Add to `.env.example`
 
 ```bash
-MY_NEW_SERVICE_HOST=localhost
-MY_NEW_SERVICE_PORT=9000
+ADAPTER_PRESSURE_HOST=localhost
+ADAPTER_PRESSURE_PORT=5004
+ADAPTER_PRESSURE_MQTT_HOST=localhost
+ADAPTER_PRESSURE_MQTT_PORT=1887
+ADAPTER_PRESSURE_MQTT_WS_PORT=9005
+```
+
+### Step 7 — Add a named fixture to `conftest.py` (optional but convenient)
+
+```python
+@pytest.fixture(scope="session")
+def pressure_mqtt_client(mqtt_client_for):
+    return mqtt_client_for("pressure")
+
+@pytest.fixture(scope="session")
+def pressure_adapter_cfg(env_config):
+    return env_config.adapters["pressure"]
 ```
 
 ---
 
-## 12. Test layer reference
+## 14. Test layer reference
 
-### Unit tests
+### Base adapter tests (`base_adapter_tests.py`)
 
-- **Location:** `tests/unit/test_<component>/`
-- **Marker:** `@pytest.mark.unit`
-- **Requires:** The component's HTTP API to be reachable. No other services needed.
-- **What they cover:**
-  - Health endpoint returns 200 with expected body structure
-  - Valid payload accepted, invalid payload rejected with correct status codes
-  - Response schemas contain expected fields
-  - Edge cases (empty payloads, negative values, oversized inputs, concurrent requests)
-  - Metrics and status endpoints accessible
+All adapter types inherit `BaseAdapterTests`. Covers:
+- HTTP health, status, metrics (all must return 200)
+- Health response reports broker running and adapter type
+- MQTT publish increments message count
+- Payload carries correct `"type"` field
+- Topic format is `devices/<device_id>`
+- Normalised output uses standard field names
+- Raw CSV payloads are processed
+- 50-message burst does not degrade health endpoint
+
+### Adapter-type-specific tests
+
+Each subclass adds domain-specific validations:
+
+| Adapter | Extra tests |
+|---|---|
+| Voltage | Nominal range (220–240 V), overvoltage flag, zero voltage not dropped, unit is volts |
+| Current | Nominal range (1–16 A), overcurrent flag, zero current valid, unit is amperes |
+| Temperature | Range (0–85 °C), high-temp flag, sub-zero valid, unit is Celsius |
+
+### Processor routing tests
+
+| Test class | Marker | When it runs |
+|---|---|---|
+| `TestProcessorOnPremRouting` | `processor_onprem` | `PROCESSOR_TARGET=onprem` |
+| `TestProcessorCloudRouting` | `processor_cloud` | `PROCESSOR_TARGET=cloud` |
 
 ### Integration tests
 
-- **Location:** `tests/integration/test_integration.py`
-- **Marker:** `@pytest.mark.integration`
-- **Requires:** All containers running via Docker Compose or on a shared network.
-- **What they cover:**
-  - A publish to the adapter increments the router's message counter
-  - A router dispatch increments the proxy's request counter
-  - A proxy forward triggers an ingest on the processor
-  - A processor ingest writes a record to CrateDB (verified by direct SQL query)
-  - Full adapter-to-database pipeline: one publish, verify row in CrateDB
-
-### E2E tests
-
-- **Location:** `tests/e2e/test_e2e.py`
-- **Marker:** `@pytest.mark.e2e`
-- **Requires:** All services up, including the landing page.
-- **What they cover:**
-  - Data published via adapter is visible on the landing page API after pipeline propagation
-  - Multiple devices all appear on the landing page
-  - Time-series history returns ≥ N points after N publishes
-  - Landing page health and device list endpoints
+Entry point is always MQTT publish on a specific adapter's broker. Verifies each boundary: MQTT→Adapter count, Adapter→Router count, Router→Proxy count, Proxy→Processor count, Processor→CrateDB row.
 
 ### Smoke tests
 
-- **Location:** `tests/e2e/test_e2e.py` — class `TestSmoke`
-- **Marker:** `@pytest.mark.smoke`
-- **Requires:** All services up.
-- **What they cover:**
-  - All six services return 200 on their health endpoints
-  - One payload traverses the full pipeline without a 5xx error
-- **Target runtime:** Under 30 seconds
+- All three adapter brokers connected
+- All 7 service health endpoints return 200
+- One QoS-1 publish per adapter type is broker-acknowledged
 
 ---
 
-## 13. Pytest marker cheat sheet
+## 15. Pytest marker cheat sheet
 
 ```bash
-# By test layer
+# By adapter type
+pytest -m "unit and voltage"
+pytest -m "unit and current"
+pytest -m "unit and temperature"
+pytest -m "unit and adapter"          # all adapter types
+
+# Processor routing
+PROCESSOR_TARGET=onprem pytest -m processor_onprem
+PROCESSOR_TARGET=cloud  pytest -m processor_cloud
+pytest -m processor                   # all processor tests (auto-skips wrong target)
+
+# By layer
 pytest -m unit
 pytest -m integration
 pytest -m e2e
 pytest -m smoke
 
-# By component
-pytest -m adapter
-pytest -m router
-pytest -m proxy
-pytest -m processor
-pytest -m db
-pytest -m landing
+# Combined
+pytest -m "unit and adapter and not temperature"
+pytest -m "integration and (voltage or current)"
+pytest -m "processor and processor_onprem"
 
-# Combined (AND)
-pytest -m "unit and adapter"
-pytest -m "integration and db"
-pytest -m "e2e and not smoke"
-
-# Combined (OR)
-pytest -m "adapter or router"
-
-# Exclude a marker
-pytest -m "unit and not db"
-
-# Environment-specific
-pytest -m onprem      # only runs when ENV=onprem
-pytest -m cloud       # only runs when ENV=cloud
+# Environment
+pytest -m onprem
+pytest -m cloud
 ```
 
 ---
 
-## 14. Troubleshooting
+## 16. Troubleshooting
 
-### "Connection refused" on a unit test
+### Wrong adapter broker connecting
 
-The service is not running or is on the wrong host/port. Check:
-
-```bash
-# Confirm the service is up
-curl http://localhost:5000/health
-
-# Check your .env values
-cat .env | grep ADAPTER
-
-# Check if the port is actually bound
-lsof -i :5000
-```
-
-### Docker Compose service stuck in "starting" or "unhealthy"
+Each adapter type connects to its own broker on a unique port. If a test is connecting to the wrong broker, check:
+1. `ADAPTER_VOLTAGE_MQTT_PORT`, `ADAPTER_CURRENT_MQTT_PORT`, `ADAPTER_TEMPERATURE_MQTT_PORT` in `.env`
+2. The `mqtt_client_for("voltage")` fixture — it reads `env_config.adapters["voltage"].mqtt_port`
 
 ```bash
-# View healthcheck logs for a specific service
-docker inspect test-adapter | python3 -m json.tool | grep -A 10 Health
-
-# View full container logs
-docker compose -f docker/docker-compose.test.yml logs --tail=50 adapter
-
-# Restart a single service
-docker compose -f docker/docker-compose.test.yml restart adapter
+# Verify which port each adapter's broker is on
+cat .env | grep MQTT_PORT
 ```
 
-### CrateDB tests failing with "table not found"
+### Processor routing test failing: data in wrong DB
 
-The processor creates the `device_readings` table on first startup. If the processor hasn't started or ingested any data yet, the table may not exist. Trigger at least one ingest:
+1. Confirm `PROCESSOR_TARGET` matches what the container was started with:
+   ```bash
+   docker inspect test-processor | grep PROCESSOR_TARGET
+   ```
+2. Confirm the routing status endpoint agrees:
+   ```bash
+   curl http://localhost:8501/routing/status
+   ```
+3. If you changed `PROCESSOR_TARGET`, restart the processor container — it reads this at startup.
 
-```bash
-curl -X POST http://localhost:8501/ingest \
-  -H "Content-Type: application/json" \
-  -d '{"device_id":"seed-dev","timestamp":1700000000000,"readings":{"voltage":220,"current":3,"temperature":45}}'
-```
+### "Adapter type X not found in config"
 
-### Azure DevOps pipeline: integration stage fails immediately
+You added a new adapter to `utils/adapter_registry.py` but forgot to add it to `config/env_config.py`. Add an entry in `ONPREM_CONFIG.adapters` and `CLOUD_CONFIG.adapters`.
 
-The Docker agent may not have access to your container registry. Add a Docker login step before the compose up:
+### Docker Compose: adapter container unhealthy
+
+Each adapter's healthcheck hits its own HTTP port (`5001` inside the container, mapped to `5001/5002/5003` on the host). The healthcheck uses the internal container port:
 
 ```yaml
-- task: Docker@2
-  inputs:
-    command: login
-    containerRegistry: <your-service-connection-name>
-  displayName: "Login to container registry"
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:5001/health"]  # internal port always 5001
 ```
 
-### Tests are flaky (pass sometimes, fail others)
-
-Increase the propagation wait time in integration and E2E tests. Look for `time.sleep(2)` or `time.sleep(5)` calls and increase them. For a more robust approach, use the `wait_for_service` helper from `conftest.py` with a polling loop instead of a fixed sleep.
-
-### Running tests in parallel causes failures
-
-Some tests share CrateDB state. If running with `pytest -n auto`, isolate each test's data with a unique `device_id` per test (the fixtures already do this with timestamps). If failures persist, run CrateDB tests sequentially:
-
+Check logs:
 ```bash
-pytest tests/unit/test_db/ -n 0
-pytest tests/unit/test_adapter/ -n 4
+docker compose -f docker/docker-compose.test.yml logs adapter-voltage
+```
+
+### MQTT tests: `ConnectionError: Could not connect within 10s`
+
+The embedded Mosquitto in the adapter may not be ready. The `ensure_adapter_ready` fixture polls both the TCP port and the HTTP health endpoint. If running tests without this fixture:
+
+```python
+# Add to your test module's autouse fixture:
+@pytest.fixture(autouse=True)
+def wait_ready(ensure_adapter_ready): pass
+```
+
+### Processor cloud tests skipped unexpectedly
+
+Check `PROCESSOR_TARGET` is set before running:
+```bash
+echo $PROCESSOR_TARGET   # must print "cloud"
+PROCESSOR_TARGET=cloud pytest tests/unit/test_processor/ -m processor_cloud
 ```
 
 ---

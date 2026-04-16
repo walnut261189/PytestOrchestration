@@ -5,4 +5,5 @@ pytest-timeout==2.3.1
 pytest-xdist==3.5.0          # parallel test execution: pytest -n auto
 pytest-rerunfailures==14.0   # retry flaky tests: @pytest.mark.flaky(reruns=2)
 requests==2.32.3
+paho-mqtt==1.6.1              # MQTT client for Mosquitto broker tests
 python-dotenv==1.0.1          # load .env files for local dev

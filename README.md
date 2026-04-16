@@ -127,4 +127,3 @@ All `AZURE_*` env vars in `.env` (or the pipeline variable group) are used autom
 kubectl apply -f k8s/test-runner-job.yaml
 kubectl logs -f job/iot-pipeline-test-runner
 ```
-"# PytestOrchestration" 

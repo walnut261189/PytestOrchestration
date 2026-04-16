@@ -131,6 +131,10 @@ class TestSmoke:
     """Fast smoke suite – run first after every deployment."""
 
     @pytest.mark.smoke
+    def test_mosquitto_broker_reachable(self, mqtt_client):
+        assert mqtt_client.is_connected(), "Cannot connect to Mosquitto broker"
+
+    @pytest.mark.smoke
     def test_adapter_alive(self, adapter_url, http_client):
         assert http_client.get(f"{adapter_url}/health", timeout=5).status_code == 200
 
@@ -151,13 +155,15 @@ class TestSmoke:
         assert http_client.get(f"{landing_url}/", timeout=10).status_code == 200
 
     @pytest.mark.smoke
-    def test_single_publish_survives_pipeline(
-        self, adapter_url, http_client, sample_device_payload
+    def test_single_mqtt_publish_survives_pipeline(
+        self, mqtt_client, mqtt_config, make_raw_mqtt_payload
     ):
-        r = http_client.post(
-            f"{adapter_url}/publish",
-            json=sample_device_payload(device_id="smoke-test-device"),
-            timeout=10
+        """One MQTT publish must not cause any 5xx across the pipeline."""
+        result = mqtt_client.publish(
+            mqtt_config.topic_for("smoke-test-device"),
+            make_raw_mqtt_payload(device_id="smoke-test-device"),
+            qos=1,
         )
-        assert r.status_code in (200, 201, 202), \
-            f"Smoke publish failed: {r.status_code} – {r.text}"
+        result.wait_for_publish(timeout=10)
+        assert result.is_published(), \
+            "Smoke MQTT publish was not acknowledged by Mosquitto broker"

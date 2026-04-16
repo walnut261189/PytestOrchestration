@@ -1,12 +1,20 @@
 # ─────────────────────────────────────────────────────────────────
 # docker/docker-compose.test.yml
 #
-# Spins up all pipeline components for integration / e2e testing.
-# Replace image names and ports to match your actual images.
+# Three separate adapter containers, each with its own embedded
+# Mosquitto broker on a unique port.
 #
-# Usage:
-#   docker compose -f docker/docker-compose.test.yml up -d
-#   docker compose -f docker/docker-compose.test.yml down -v
+# Startup order:
+#   cratedb → processor → proxy → router
+#          → adapter-voltage (port 1884)
+#          → adapter-current (port 1885)
+#          → adapter-temperature (port 1886)
+#          → landing
+#
+# Adding a new adapter type:
+#   1. Add a service block below following the same pattern
+#   2. Use the next available port (1887, 9005, 5004 etc.)
+#   3. Add its env vars to .env.example and env_config.py
 # ─────────────────────────────────────────────────────────────────
 
 version: "3.9"
@@ -20,13 +28,13 @@ volumes:
 
 services:
 
-  # ── CrateDB ──────────────────────────────────────────────────────
+  # ── CrateDB (on-prem DB) ──────────────────────────────────────────
   cratedb:
     image: crate:latest
     container_name: test-cratedb
     ports:
-      - "4200:4200"    # HTTP / Admin UI
-      - "5432:5432"    # PostgreSQL-wire protocol
+      - "4200:4200"
+      - "5432:5432"
     environment:
       - CRATE_HEAP_SIZE=512m
     volumes:
@@ -39,56 +47,43 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── Adapter ──────────────────────────────────────────────────────
-  adapter:
-    image: ${ADAPTER_IMAGE:-your-registry/iot-adapter:latest}
-    container_name: test-adapter
+  # ── Streamlit Processor ───────────────────────────────────────────
+  # PROCESSOR_TARGET controls where data is routed:
+  #   onprem → CrateDB   |   cloud → cloud DB
+  processor:
+    image: ${PROCESSOR_IMAGE:-your-registry/iot-processor:latest}
+    container_name: test-processor
     ports:
-      - "5000:5000"
+      - "8501:8501"
     environment:
       - ENV=onprem
-      - ROUTER_HOST=router
-      - ROUTER_PORT=6000
+      - PROCESSOR_TARGET=${PROCESSOR_TARGET:-onprem}
+      - CRATEDB_HOST=cratedb
+      - CRATEDB_PORT=5432
+      - CRATEDB_HTTP_PORT=4200
+      - CLOUD_DB_HOST=${CLOUD_DB_HOST:-}
+      - CLOUD_DB_PORT=${CLOUD_DB_PORT:-1433}
+      - CLOUD_DB_NAME=${CLOUD_DB_NAME:-iot_pipeline}
+      - CLOUD_DB_USER=${CLOUD_DB_USER:-}
+      - CLOUD_DB_PASSWORD=${CLOUD_DB_PASSWORD:-}
     networks:
       - pipeline-net
     depends_on:
-      router:
+      cratedb:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
       interval: 10s
       timeout: 5s
       retries: 10
 
-  # ── Router ───────────────────────────────────────────────────────
-  router:
-    image: ${ROUTER_IMAGE:-your-registry/iot-router:latest}
-    container_name: test-router
-    ports:
-      - "6000:6000"
-    environment:
-      - ENV=onprem
-      - PROXY_HOST=proxy
-      - PROXY_PORT=7000
-    networks:
-      - pipeline-net
-    depends_on:
-      proxy:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Proxy ────────────────────────────────────────────────────────
+  # ── Proxy ─────────────────────────────────────────────────────────
   proxy:
     image: ${PROXY_IMAGE:-your-registry/iot-proxy:latest}
     container_name: test-proxy
     ports:
       - "7000:7000"
     environment:
-      - ENV=onprem
       - PROCESSOR_HOST=processor
       - PROCESSOR_PORT=8501
     networks:
@@ -102,38 +97,109 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── Streamlit Processor ──────────────────────────────────────────
-  processor:
-    image: ${PROCESSOR_IMAGE:-your-registry/iot-processor:latest}
-    container_name: test-processor
+  # ── Router ────────────────────────────────────────────────────────
+  router:
+    image: ${ROUTER_IMAGE:-your-registry/iot-router:latest}
+    container_name: test-router
     ports:
-      - "8501:8501"
+      - "6000:6000"
     environment:
-      - ENV=onprem
-      - CRATEDB_HOST=cratedb
-      - CRATEDB_PORT=5432
-      - CRATEDB_HTTP_PORT=4200
+      - PROXY_HOST=proxy
+      - PROXY_PORT=7000
     networks:
       - pipeline-net
     depends_on:
-      cratedb:
+      proxy:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:6000/health"]
       interval: 10s
       timeout: 5s
       retries: 10
 
-  # ── Landing Page ─────────────────────────────────────────────────
+  # ── Voltage Adapter (embeds Mosquitto on port 1884) ───────────────
+  adapter-voltage:
+    image: ${ADAPTER_VOLTAGE_IMAGE:-your-registry/iot-adapter-voltage:latest}
+    container_name: test-adapter-voltage
+    ports:
+      - "5001:5001"    # HTTP management API
+      - "1884:1883"    # Mosquitto MQTT (mapped to unique host port)
+      - "9002:9001"    # Mosquitto WebSocket
+    environment:
+      - ADAPTER_TYPE=voltage
+      - MQTT_TOPIC_PREFIX=devices
+      - MQTT_QOS=1
+      - ROUTER_HOST=router
+      - ROUTER_PORT=6000
+    networks:
+      - pipeline-net
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Current Adapter (embeds Mosquitto on port 1885) ───────────────
+  adapter-current:
+    image: ${ADAPTER_CURRENT_IMAGE:-your-registry/iot-adapter-current:latest}
+    container_name: test-adapter-current
+    ports:
+      - "5002:5001"
+      - "1885:1883"
+      - "9003:9001"
+    environment:
+      - ADAPTER_TYPE=current
+      - MQTT_TOPIC_PREFIX=devices
+      - MQTT_QOS=1
+      - ROUTER_HOST=router
+      - ROUTER_PORT=6000
+    networks:
+      - pipeline-net
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Temperature Adapter (embeds Mosquitto on port 1886) ───────────
+  adapter-temperature:
+    image: ${ADAPTER_TEMPERATURE_IMAGE:-your-registry/iot-adapter-temperature:latest}
+    container_name: test-adapter-temperature
+    ports:
+      - "5003:5001"
+      - "1886:1883"
+      - "9004:9001"
+    environment:
+      - ADAPTER_TYPE=temperature
+      - MQTT_TOPIC_PREFIX=devices
+      - MQTT_QOS=1
+      - ROUTER_HOST=router
+      - ROUTER_PORT=6000
+    networks:
+      - pipeline-net
+    depends_on:
+      router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Landing Page ──────────────────────────────────────────────────
   landing:
     image: ${LANDING_IMAGE:-your-registry/iot-landing:latest}
     container_name: test-landing
     ports:
       - "3000:3000"
     environment:
-      - ENV=onprem
       - PROCESSOR_HOST=processor
-      - PROCESSOR_PORT=8501
       - CRATEDB_HOST=cratedb
     networks:
       - pipeline-net
